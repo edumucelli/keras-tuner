@@ -224,6 +224,78 @@ class Tuner(base_tuner.BaseTuner):
             results, self.oracle.objective, "HyperModel.fit()"
         )
         return results
+    #
+    # def run_trial(self, trial, *args, **kwargs):
+    #     """Evaluates a set of hyperparameter values.
+    #
+    #     This method is called multiple times during `search` to build and
+    #     evaluate the models with different hyperparameters and return the
+    #     objective value.
+    #
+    #     Example:
+    #
+    #     You can use it with `self.hypermodel` to build and fit the model.
+    #
+    #     ```python
+    #     def run_trial(self, trial, *args, **kwargs):
+    #         hp = trial.hyperparameters
+    #         model = self.hypermodel.build(hp)
+    #         return self.hypermodel.fit(hp, model, *args, **kwargs)
+    #     ```
+    #
+    #     You can also use it as a black-box optimizer for anything.
+    #
+    #     ```python
+    #     def run_trial(self, trial, *args, **kwargs):
+    #         hp = trial.hyperparameters
+    #         x = hp.Float("x", -2.0, 2.0)
+    #         y = x * x + 2 * x + 1
+    #         return y
+    #     ```
+    #
+    #     Args:
+    #         trial: A `Trial` instance that contains the information needed to
+    #             run this trial. Hyperparameters can be accessed via
+    #             `trial.hyperparameters`.
+    #         *args: Positional arguments passed by `search`.
+    #         **kwargs: Keyword arguments passed by `search`.
+    #
+    #     Returns:
+    #         A `History` object, which is the return value of `model.fit()`, a
+    #         dictionary, a float, or a list of one of these types.
+    #
+    #         If return a dictionary, it should be a dictionary of the metrics to
+    #         track. The keys are the metric names, which contains the
+    #         `objective` name. The values should be the metric values.
+    #
+    #         If return a float, it should be the `objective` value.
+    #
+    #         If evaluating the model for multiple times, you may return a list
+    #         of results of any of the types above. The final objective value is
+    #         the average of the results in the list.
+    #     """
+    #     # Not using `ModelCheckpoint` to support MultiObjective.
+    #     # It can only track one of the metrics to save the best model.
+    #     model_checkpoint = tuner_utils.SaveBestEpoch(
+    #         objective=self.oracle.objective,
+    #         filepath=self._get_checkpoint_fname(trial.trial_id),
+    #     )
+    #     original_callbacks = kwargs.pop("callbacks", [])
+    #
+    #     # Run the training process multiple times.
+    #     histories = []
+    #     for execution in range(self.executions_per_trial):
+    #         copied_kwargs = copy.copy(kwargs)
+    #         callbacks = self._deepcopy_callbacks(original_callbacks)
+    #         self._configure_tensorboard_dir(callbacks, trial, execution)
+    #         callbacks.append(tuner_utils.TunerCallback(self, trial))
+    #         # Only checkpoint the best epoch across all executions.
+    #         callbacks.append(model_checkpoint)
+    #         copied_kwargs["callbacks"] = callbacks
+    #         obj_value = self._build_and_fit_model(trial, *args, **copied_kwargs)
+    #
+    #         histories.append(obj_value)
+    #     return histories
 
     def run_trial(self, trial, *args, **kwargs):
         """Evaluates a set of hyperparameter values.
@@ -286,12 +358,24 @@ class Tuner(base_tuner.BaseTuner):
         histories = []
         for execution in range(self.executions_per_trial):
             copied_kwargs = copy.copy(kwargs)
-            callbacks = self._deepcopy_callbacks(original_callbacks)
-            self._configure_tensorboard_dir(callbacks, trial, execution)
-            callbacks.append(tuner_utils.TunerCallback(self, trial))
+            copied_callbacks = self._deepcopy_callbacks(original_callbacks)
+            # If tensorboard is among the original callbacks, we will need to
+            # patch its log directory to point to one with the format of:
+            # log_dir/trial_id/execution{number}
+            tensorboard_callback = self._find_tensorboard_callback(copied_callbacks)
+            if tensorboard_callback:
+                execution_log_dir = self._get_execution_log_dir(
+                    tensorboard_callback.log_dir, trial.trial_id, execution
+                )
+                tensorboard_callback.log_dir = execution_log_dir
+                # Build a callback specific for keras logs on Tensorboard.
+                copied_callbacks.append(
+                    self._build_keras_callback(trial, execution_log_dir)
+                )
+            copied_callbacks.append(tuner_utils.TunerCallback(self, trial))
             # Only checkpoint the best epoch across all executions.
-            callbacks.append(model_checkpoint)
-            copied_kwargs["callbacks"] = callbacks
+            copied_callbacks.append(model_checkpoint)
+            copied_kwargs["callbacks"] = copied_callbacks
             obj_value = self._build_and_fit_model(trial, *args, **copied_kwargs)
 
             histories.append(obj_value)
@@ -389,7 +473,7 @@ class Tuner(base_tuner.BaseTuner):
         for callback in callbacks:
             if callback.__class__.__name__ == "TensorBoard":
                 # Patch TensorBoard log_dir and add HParams KerasCallback
-                logdir = self._get_tensorboard_dir(
+                logdir = self._get_execution_log_dir(
                     callback.log_dir, trial.trial_id, execution
                 )
                 callback.log_dir = logdir
@@ -402,7 +486,22 @@ class Tuner(base_tuner.BaseTuner):
                     )
                 )
 
-    def _get_tensorboard_dir(self, logdir, trial_id, execution):
+    def _find_tensorboard_callback(self, callbacks):
+        for callback in callbacks:
+            if callback.__class__.__name__ == "TensorBoard":
+                return callback
+        return None
+
+    def _build_keras_callback(self, trial, logdir):
+        hparams = tuner_utils.convert_hyperparams_to_hparams(
+            trial.hyperparameters
+        )
+
+        return hparams_api.KerasCallback(
+            writer=logdir, hparams=hparams, trial_id=trial.trial_id
+        )
+
+    def _get_execution_log_dir(self, logdir, trial_id, execution):
         return os.path.join(str(logdir), str(trial_id), "execution" + str(execution))
 
     def _get_checkpoint_fname(self, trial_id):
